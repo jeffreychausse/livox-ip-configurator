@@ -1,0 +1,20 @@
+# CMake & Build outputs
+build/
+bin/
+out/
+CMakeFiles/
+CMakeCache.txt
+
+# IDE / Visual Studio / VSCode
+.vs/
+*.user
+*.vcxproj.user
+.vscode/*
+!.vscode/settings.json
+
+# Binaries
+*.exe
+*.lib
+*.dll
+*.obj
+*.pdb
