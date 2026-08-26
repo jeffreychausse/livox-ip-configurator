@@ -1,0 +1,61 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 16,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "windows-vs2022",
+            "displayName": "Visual Studio 2022 (x64)",
+            "description": "Use Visual Studio 2022 generator (requires full VS installation)",
+            "generator": "Visual Studio 17 2022",
+            "architecture": {
+                "value": "x64",
+                "strategy": "set"
+            },
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "windows-ninja",
+            "displayName": "Ninja (x64 Release)",
+            "description": "Use Ninja generator (works with Build Tools)",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "vs2022-debug",
+            "configurePreset": "windows-vs2022",
+            "configuration": "Debug"
+        },
+        {
+            "name": "vs2022-release",
+            "configurePreset": "windows-vs2022",
+            "configuration": "Release"
+        },
+        {
+            "name": "ninja-release",
+            "configurePreset": "windows-ninja"
+        }
+    ]
+}
