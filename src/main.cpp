@@ -48,6 +48,7 @@
 #include <string>
 #include <mutex>
 #include <map>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -115,7 +116,13 @@ struct LidarDeviceInfo {
     std::string serialNumber;      // Sensor serial number
     std::string currentIp;         // Sensor's current IP address
     uint8_t     devType = 0;       // Device type (see LivoxLidarDeviceType)
-    std::string status = "Online"; // Simple online/offline status string
+    bool        online = true;     // Liveness state derived from lastSeenTime
+    std::chrono::steady_clock::time_point lastSeenTime;  // Updated on each discovery callback
+
+    // Full IP configuration obtained via QueryLivoxLidarInternalInfo()
+    bool        ipConfigQueried = false;  // true once the query has returned successfully
+    std::string currentNetmask;           // Subnet mask (e.g. "255.255.255.0")
+    std::string currentGateway;           // Gateway (e.g. "192.168.1.1")
 };
 
 // Discovered sensors, protected by g_lidarDevicesMutex since updates arrive on
@@ -126,6 +133,9 @@ static std::map<uint32_t, LidarDeviceInfo> g_lidarDevices;
 // Handle of the sensor currently selected in the discovered sensors table (0 = none)
 static uint32_t g_selectedLidarHandle = 0;
 
+// True after a successful "Push New IP" until the sensor is rebooted or deselected
+static bool g_rebootRequired = false;
+
 // Whether the Livox SDK has been successfully initialized/started
 static bool g_sdkInitialized = false;
 
@@ -134,8 +144,8 @@ static std::string g_tempConfigPath;
 
 // Input buffers for the IP configuration panel
 static char g_newIpBuffer[64]     = "";
-static char g_netmaskBuffer[64]   = "255.255.255.0";
-static char g_gatewayBuffer[64]   = "192.168.1.1";
+static char g_netmaskBuffer[64]   = "";
+static char g_gatewayBuffer[64]   = "";
 
 // Rolling log of status/informational messages shown at the bottom of the UI,
 // protected by g_logMutex since SDK callbacks append to it from other threads.
@@ -296,22 +306,26 @@ void OnLivoxLidarInfoChange(const uint32_t handle, const LivoxLidarInfo* info, v
         return;
     }
 
-    LidarDeviceInfo device;
-    device.handle = handle;
-    device.serialNumber = info->sn;
-    device.currentIp = HandleToIpString(handle);
-    device.devType = info->dev_type;
-    device.status = "Online";
-
     bool isNewDevice = false;
     {
         std::lock_guard<std::mutex> lock(g_lidarDevicesMutex);
         isNewDevice = (g_lidarDevices.find(handle) == g_lidarDevices.end());
-        g_lidarDevices[handle] = device;
+
+        // Update discovery fields while preserving any previously queried IP config
+        LidarDeviceInfo& device = g_lidarDevices[handle];
+        device.handle = handle;
+        device.serialNumber = info->sn;
+        device.currentIp = HandleToIpString(handle);
+        device.devType = info->dev_type;
+        device.online = true;
+        device.lastSeenTime = std::chrono::steady_clock::now();
+        // ipConfigQueried, currentNetmask, currentGateway are left as-is for
+        // existing entries so a previously successful query is not discarded.
     }
 
     if (isNewDevice) {
-        AddLogMessage("Discovered sensor SN:" + device.serialNumber + " at IP:" + device.currentIp);
+        const std::string sn = info->sn;
+        AddLogMessage("Discovered sensor SN:" + sn + " at IP:" + HandleToIpString(handle));
     }
 }
 
@@ -327,6 +341,7 @@ void OnSetLivoxLidarIp(livox_status status, uint32_t handle, LivoxLidarAsyncCont
     }
 
     if (status == kLivoxLidarStatusSuccess && response->ret_code == 0 && response->error_key == 0) {
+        g_rebootRequired = true;
         AddLogMessage("IP set successfully. Reboot required for the change to take effect.");
     } else {
         AddLogMessage("Error: Failed to set IP (status:" + std::to_string(status) +
@@ -336,9 +351,9 @@ void OnSetLivoxLidarIp(livox_status status, uint32_t handle, LivoxLidarAsyncCont
 }
 
 /**
- * @brief Callback invoked when a LivoxLidarRequestReset() request completes.
+ * @brief Callback invoked when a LivoxLidarRequestReboot() request completes.
  */
-void OnLivoxLidarReset(livox_status status, uint32_t handle, LivoxLidarResetResponse* response, void* clientData)
+void OnLivoxLidarReboot(livox_status status, uint32_t handle, LivoxLidarRebootResponse* response, void* clientData)
 {
     UNREFERENCED_PARAMETER(clientData);
     UNREFERENCED_PARAMETER(handle);
@@ -348,11 +363,99 @@ void OnLivoxLidarReset(livox_status status, uint32_t handle, LivoxLidarResetResp
     }
 
     if (status == kLivoxLidarStatusSuccess && response->ret_code == 0) {
+        g_rebootRequired = false;
         AddLogMessage("Sensor is rebooting to apply the new configuration.");
     } else {
         AddLogMessage("Error: Reboot request failed (status:" + std::to_string(status) +
                       " ret_code:" + std::to_string(response->ret_code) + ").");
     }
+}
+
+/**
+ * @brief Callback invoked when a QueryLivoxLidarInternalInfo() request completes.
+ *
+ * Parses the KV response to extract kKeyLidarIpCfg (key 0x0004) which contains
+ * the sensor's current IP address, subnet mask, and gateway (12 bytes total).
+ * Updates the cached LidarDeviceInfo and fills the UI input buffers so the user
+ * sees the sensor's actual configuration when they click on it.
+ *
+ * Runs on an SDK-internal thread; shared state is updated under g_lidarDevicesMutex.
+ */
+void OnQueryLidarInternalInfo(livox_status status, uint32_t handle,
+                              LivoxLidarDiagInternalInfoResponse* response, void* clientData)
+{
+    UNREFERENCED_PARAMETER(clientData);
+
+    if (status != kLivoxLidarStatusSuccess) {
+        AddLogMessage("Query IP config failed (status:" + std::to_string(status) +
+                      " handle:" + std::to_string(handle) + ").");
+        return;
+    }
+    if (response == nullptr) {
+        AddLogMessage("Query IP config failed: null response (handle:" + std::to_string(handle) + ").");
+        return;
+    }
+    if (response->ret_code != 0) {
+        AddLogMessage("Query IP config failed (ret_code:" + std::to_string(response->ret_code) +
+                      " handle:" + std::to_string(handle) + ").");
+        return;
+    }
+
+    // Walk the packed KV list looking for kKeyLidarIpCfg (0x0004).
+    // The value is 12 bytes: ip[4] + subnet_mask[4] + gateway[4].
+    std::string queriedIp;
+    std::string queriedNetmask;
+    std::string queriedGateway;
+    bool found = false;
+
+    uint16_t off = 0;
+    for (uint16_t i = 0; i < response->param_num; ++i) {
+        if (off + sizeof(uint16_t) * 2 > 1400) break;  // safety bound
+        LivoxLidarKeyValueParam* kv = reinterpret_cast<LivoxLidarKeyValueParam*>(&response->data[off]);
+
+        if (kv->key == static_cast<uint16_t>(kKeyLidarIpCfg) && kv->length >= 12) {
+            const uint8_t* v = &kv->value[0];
+            queriedIp      = std::to_string(v[0]) + "." + std::to_string(v[1]) + "." +
+                             std::to_string(v[2]) + "." + std::to_string(v[3]);
+            queriedNetmask = std::to_string(v[4]) + "." + std::to_string(v[5]) + "." +
+                             std::to_string(v[6]) + "." + std::to_string(v[7]);
+            queriedGateway = std::to_string(v[8]) + "." + std::to_string(v[9]) + "." +
+                             std::to_string(v[10]) + "." + std::to_string(v[11]);
+            found = true;
+            break;
+        }
+
+        // Advance past this KV entry: key(2) + length(2) + value(kv->length)
+        off += sizeof(uint16_t) * 2 + kv->length;
+    }
+
+    if (!found) {
+        AddLogMessage("Query IP config: kKeyLidarIpCfg not found in response (handle:" +
+                      std::to_string(handle) + ").");
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_lidarDevicesMutex);
+        auto it = g_lidarDevices.find(handle);
+        if (it != g_lidarDevices.end()) {
+            it->second.ipConfigQueried = true;
+            it->second.currentNetmask  = queriedNetmask;
+            it->second.currentGateway  = queriedGateway;
+            // Update the IP from the query too — it's the authoritative source
+            it->second.currentIp = queriedIp;
+        }
+
+        // If this handle is still the selected sensor, populate the input buffers
+        if (handle == g_selectedLidarHandle) {
+            strncpy_s(g_newIpBuffer,   queriedIp.c_str(),      sizeof(g_newIpBuffer) - 1);
+            strncpy_s(g_netmaskBuffer, queriedNetmask.c_str(), sizeof(g_netmaskBuffer) - 1);
+            strncpy_s(g_gatewayBuffer, queriedGateway.c_str(), sizeof(g_gatewayBuffer) - 1);
+        }
+    }
+
+    AddLogMessage("Queried IP config for handle:" + std::to_string(handle) +
+                  " — IP:" + queriedIp + " Mask:" + queriedNetmask + " GW:" + queriedGateway);
 }
 
 // ============================================================================
@@ -420,6 +523,70 @@ std::string GenerateLivoxConfigFile(const std::string& hostIp)
 }
 
 /**
+ * @brief Checks whether any of the Livox SDK UDP ports are already bound by
+ *        another process and logs warnings for each conflict found.
+ *
+ * Uses the Windows IP Helper API (GetExtendedUdpTable) to enumerate all UDP
+ * endpoints currently bound on the system together with their owning PIDs.
+ * This works reliably even when SO_REUSEADDR is set (which the Livox SDK
+ * uses on all of its sockets), unlike a test-bind approach that would
+ * silently succeed in that case.
+ *
+ * Called before LivoxLidarSdkInit() so the user gets a clear, actionable
+ * warning if another application (e.g. another SDK instance, ROS driver,
+ * or Livox Viewer) already holds any of the required ports.
+ */
+static void CheckLivoxPortsInUse(const std::string& hostIp)
+{
+    UNREFERENCED_PARAMETER(hostIp);
+
+    struct PortInfo { uint16_t port; const char* name; };
+    static const PortInfo ports[] = {
+        { 56000, "Detection"        },
+        { 56101, "Host Cmd"         },
+        { 56201, "Host Push Msg"    },
+        { 56301, "Host Point Cloud" },
+        { 56401, "Host IMU Data"    },
+        { 56501, "Host Log Data"    },
+    };
+
+    // Query the OS for all UDP endpoints.  First call with size 0 to learn
+    // the required buffer size, then allocate and call again.
+    DWORD tableSize = 0;
+    DWORD result = GetExtendedUdpTable(nullptr, &tableSize, FALSE, AF_INET,
+                                       UDP_TABLE_OWNER_PID, 0);
+    if (result != ERROR_INSUFFICIENT_BUFFER) {
+        return;  // Unexpected — can't enumerate
+    }
+
+    std::vector<uint8_t> buffer(tableSize);
+    result = GetExtendedUdpTable(buffer.data(), &tableSize, FALSE, AF_INET,
+                                 UDP_TABLE_OWNER_PID, 0);
+    if (result != NO_ERROR) {
+        return;
+    }
+
+    const MIB_UDPTABLE_OWNER_PID* udpTable =
+        reinterpret_cast<const MIB_UDPTABLE_OWNER_PID*>(buffer.data());
+
+    DWORD ownPid = GetCurrentProcessId();
+
+    for (const auto& p : ports) {
+        uint16_t netPort = htons(p.port);
+        for (DWORD i = 0; i < udpTable->dwNumEntries; ++i) {
+            const MIB_UDPROW_OWNER_PID& row = udpTable->table[i];
+            if (row.dwLocalPort == netPort && row.dwOwningPid != ownPid) {
+                AddLogMessage("Warning: UDP port " + std::to_string(p.port) +
+                              " (" + p.name + ") is already bound by PID " +
+                              std::to_string(row.dwOwningPid) +
+                              ". Another application may be using the Livox SDK.");
+                break;  // One match per port is enough
+            }
+        }
+    }
+}
+
+/**
  * @brief Initializes and starts the Livox SDK2 using the given host adapter IP.
  *
  * Generates an in-memory MID360 configuration, writes it to a temp file,
@@ -442,6 +609,11 @@ void StartLivoxSdk(const std::string& hostIp)
     if (g_tempConfigPath.empty()) {
         return;
     }
+
+    // Check for port conflicts before init — the SDK uses SO_REUSEADDR so
+    // init will succeed even when ports are already held by another process,
+    // but discovery will silently fail because responses go to the other app.
+    CheckLivoxPortsInUse(hostIp);
 
     if (!LivoxLidarSdkInit(g_tempConfigPath.c_str())) {
         AddLogMessage("Error: LivoxLidarSdkInit() failed. Check the adapter IP and try again.");
@@ -489,6 +661,12 @@ void StopLivoxSdk()
         g_lidarDevices.clear();
     }
     g_selectedLidarHandle = 0;
+    g_rebootRequired = false;
+
+    // Clear the IP configuration input buffers
+    g_newIpBuffer[0]   = '\0';
+    g_netmaskBuffer[0] = '\0';
+    g_gatewayBuffer[0] = '\0';
 
     AddLogMessage("Disconnected from SDK.");
 }
@@ -711,15 +889,24 @@ int WINAPI WinMain(
         
         {
             std::lock_guard<std::mutex> lock(g_lidarDevicesMutex);
-            
+
+            // --- Liveness check ---
+            // The SDK broadcasts a detection request every 1 second and online
+            // sensors reply immediately.  If we haven't heard from a sensor in
+            // 5 seconds it is almost certainly offline (rebooting, unplugged, etc.).
+            static const auto kOfflineThreshold = std::chrono::seconds(5);
+            auto now = std::chrono::steady_clock::now();
+            for (auto& entry : g_lidarDevices) {
+                entry.second.online = (now - entry.second.lastSeenTime) < kOfflineThreshold;
+            }
+
             ImGuiTableFlags sensorTableFlags = ImGuiTableFlags_Borders
                                               | ImGuiTableFlags_RowBg
                                               | ImGuiTableFlags_Resizable;
             
-            if (ImGui::BeginTable("DiscoveredSensorsTable", 4, sensorTableFlags, ImVec2(0.0f, 150.0f))) {
+            if (ImGui::BeginTable("DiscoveredSensorsTable", 3, sensorTableFlags, ImVec2(0.0f, 150.0f))) {
                 ImGui::TableSetupColumn("Serial Number", ImGuiTableColumnFlags_WidthStretch);
                 ImGui::TableSetupColumn("Current IP", ImGuiTableColumnFlags_WidthFixed, 130.0f);
-                ImGui::TableSetupColumn("Handle", ImGuiTableColumnFlags_WidthFixed, 100.0f);
                 ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 90.0f);
                 ImGui::TableHeadersRow();
                 
@@ -732,16 +919,33 @@ int WINAPI WinMain(
                     if (ImGui::Selectable(device.serialNumber.c_str(), isSelected,
                                            ImGuiSelectableFlags_SpanAllColumns)) {
                         g_selectedLidarHandle = device.handle;
-                        // Default the "New Target IP" field to the sensor's current IP
+                        g_rebootRequired = false;
+
+                        // Populate the input buffers from cached data
                         strncpy_s(g_newIpBuffer, device.currentIp.c_str(), sizeof(g_newIpBuffer) - 1);
+
+                        if (device.ipConfigQueried) {
+                            // We already have the full config cached — use it
+                            strncpy_s(g_netmaskBuffer, device.currentNetmask.c_str(), sizeof(g_netmaskBuffer) - 1);
+                            strncpy_s(g_gatewayBuffer, device.currentGateway.c_str(), sizeof(g_gatewayBuffer) - 1);
+                        } else {
+                            // Clear netmask/gateway until the query returns
+                            g_netmaskBuffer[0] = '\0';
+                            g_gatewayBuffer[0] = '\0';
+
+                            // Fire an async query to get the actual netmask & gateway
+                            QueryLivoxLidarInternalInfo(device.handle, OnQueryLidarInternalInfo, nullptr);
+                        }
                     }
                     
                     ImGui::TableSetColumnIndex(1);
                     ImGui::TextUnformatted(device.currentIp.c_str());
                     ImGui::TableSetColumnIndex(2);
-                    ImGui::Text("%u", device.handle);
-                    ImGui::TableSetColumnIndex(3);
-                    ImGui::TextUnformatted(device.status.c_str());
+                    if (device.online) {
+                        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Online");
+                    } else {
+                        ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Offline");
+                    }
                 }
                 ImGui::EndTable();
             }
@@ -763,6 +967,25 @@ int WINAPI WinMain(
         
         ImGui::BeginDisabled(g_selectedLidarHandle == 0);
         
+        // --- Current Configuration (read-only) ---
+        {
+            std::lock_guard<std::mutex> lock(g_lidarDevicesMutex);
+            auto it = g_lidarDevices.find(g_selectedLidarHandle);
+            if (it != g_lidarDevices.end() && it->second.ipConfigQueried) {
+                const LidarDeviceInfo& sel = it->second;
+                ImGui::Text("Current:  IP: %s  |  Mask: %s  |  GW: %s",
+                            sel.currentIp.c_str(),
+                            sel.currentNetmask.c_str(),
+                            sel.currentGateway.c_str());
+            } else if (it != g_lidarDevices.end()) {
+                ImGui::TextDisabled("Current config: querying sensor...");
+            } else {
+                ImGui::TextDisabled("No sensor selected.");
+            }
+        }
+        ImGui::Spacing();
+        
+        // --- New Configuration (editable) ---
         ImGui::SetNextItemWidth(200.0f);
         ImGui::InputText("New Target IP Address", g_newIpBuffer, sizeof(g_newIpBuffer));
         ImGui::SetNextItemWidth(200.0f);
@@ -789,12 +1012,16 @@ int WINAPI WinMain(
         
         ImGui::SameLine();
         if (ImGui::Button("Reboot Sensor")) {
-            livox_status result = LivoxLidarRequestReset(g_selectedLidarHandle, OnLivoxLidarReset, nullptr);
+            livox_status result = LivoxLidarRequestReboot(g_selectedLidarHandle, OnLivoxLidarReboot, nullptr);
             if (result != kLivoxLidarStatusSuccess) {
-                AddLogMessage("Error: LivoxLidarRequestReset() call failed to send (status:" + std::to_string(result) + ").");
+                AddLogMessage("Error: LivoxLidarRequestReboot() call failed to send (status:" + std::to_string(result) + ").");
             } else {
                 AddLogMessage("Reboot request sent, waiting for sensor response...");
             }
+        }
+        if (g_rebootRequired) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "Reboot required for changes to take effect.");
         }
         
         ImGui::EndDisabled();
