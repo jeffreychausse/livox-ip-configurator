@@ -372,6 +372,31 @@ void OnLivoxLidarReboot(livox_status status, uint32_t handle, LivoxLidarRebootRe
 }
 
 /**
+ * @brief Callback invoked on every periodic "LiDAR Information Push" (cmd 0x0102).
+ *
+ * The Mid-360 sensor sends push messages at a regular interval (~1 Hz) with its
+ * current state.  This callback is registered via SetLivoxLidarInfoCallback()
+ * and is used purely for liveness tracking: it stamps lastSeenTime so the UI
+ * can distinguish online sensors from offline ones.
+ *
+ * Unlike OnLivoxLidarInfoChange (which fires only once per device), this fires
+ * repeatedly for as long as the sensor is reachable.
+ */
+void OnLivoxLidarPushMsg(const uint32_t handle, const uint8_t devType,
+                         const char* info, void* clientData)
+{
+    UNREFERENCED_PARAMETER(devType);
+    UNREFERENCED_PARAMETER(info);
+    UNREFERENCED_PARAMETER(clientData);
+
+    std::lock_guard<std::mutex> lock(g_lidarDevicesMutex);
+    auto it = g_lidarDevices.find(handle);
+    if (it != g_lidarDevices.end()) {
+        it->second.lastSeenTime = std::chrono::steady_clock::now();
+    }
+}
+
+/**
  * @brief Callback invoked when a QueryLivoxLidarInternalInfo() request completes.
  *
  * Parses the KV response to extract kKeyLidarIpCfg (key 0x0004) which contains
@@ -523,6 +548,67 @@ std::string GenerateLivoxConfigFile(const std::string& hostIp)
 }
 
 /**
+ * @brief Validates that a string is a well-formed IPv4 address (dotted decimal).
+ *
+ * Checks for exactly four octets in the range 0-255 separated by dots.
+ * Does NOT accept leading zeros (e.g. "01.02.03.04"), empty octets, or
+ * trailing/leading dots.
+ *
+ * @return true if the string is a valid IPv4 address.
+ */
+static bool IsValidIpv4(const char* str)
+{
+    if (str == nullptr || str[0] == '\0') return false;
+
+    int octets = 0;
+    int value = -1;
+    int digits = 0;
+
+    for (const char* p = str; ; ++p) {
+        if (*p >= '0' && *p <= '9') {
+            if (value < 0) value = 0;
+            value = value * 10 + (*p - '0');
+            ++digits;
+            if (value > 255 || digits > 3) return false;
+        } else if (*p == '.' || *p == '\0') {
+            if (value < 0) return false;  // empty octet or leading dot
+            ++octets;
+            value = -1;
+            digits = 0;
+            if (*p == '\0') break;
+            if (octets >= 4) return false;  // too many dots
+        } else {
+            return false;  // invalid character
+        }
+    }
+    return (octets == 4);
+}
+
+/**
+ * @brief Validates that a string is a well-formed IPv4 subnet mask.
+ *
+ * A valid subnet mask must be a valid IPv4 address AND its 32-bit value must
+ * consist of a contiguous block of 1-bits followed by 0-bits (e.g.
+ * 255.255.255.0 = 0xFFFFFF00).  All-zeros (0.0.0.0) is rejected.
+ */
+static bool IsValidSubnetMask(const char* str)
+{
+    if (!IsValidIpv4(str)) return false;
+
+    // Parse octets into a 32-bit host-order value
+    unsigned int a, b, c, d;
+    if (sscanf_s(str, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return false;
+
+    uint32_t mask = (a << 24) | (b << 16) | (c << 8) | d;
+    if (mask == 0) return false;  // 0.0.0.0 is not a useful mask
+
+    // A valid mask has all 1-bits contiguous from the MSB.
+    // Inverting and adding 1 should yield a power of two (or zero for /32).
+    uint32_t inverted = ~mask;
+    return (inverted & (inverted + 1)) == 0;
+}
+
+/**
  * @brief Checks whether any of the Livox SDK UDP ports are already bound by
  *        another process and logs warnings for each conflict found.
  *
@@ -622,6 +708,7 @@ void StartLivoxSdk(const std::string& hostIp)
     }
 
     SetLivoxLidarInfoChangeCallback(OnLivoxLidarInfoChange, nullptr);
+    SetLivoxLidarInfoCallback(OnLivoxLidarPushMsg, nullptr);
 
     if (!LivoxLidarSdkStart()) {
         AddLogMessage("Error: LivoxLidarSdkStart() failed.");
@@ -721,7 +808,7 @@ int WINAPI WinMain(
     // (widened from 800 to comfortably fit the adapter combo box plus the
     // Refresh Adapters and Connect/Disconnect buttons on a single row)
     int windowWidth = static_cast<int>(900 * dpiScale);
-    int windowHeight = static_cast<int>(600 * dpiScale);
+    int windowHeight = static_cast<int>(750 * dpiScale);
     
     HWND hwnd = CreateWindowW(
         wc.lpszClassName, L"Livox IP Configurator", WS_OVERLAPPEDWINDOW,
@@ -988,13 +1075,33 @@ int WINAPI WinMain(
         // --- New Configuration (editable) ---
         ImGui::SetNextItemWidth(200.0f);
         ImGui::InputText("New Target IP Address", g_newIpBuffer, sizeof(g_newIpBuffer));
+        bool ipValid = IsValidIpv4(g_newIpBuffer);
+        if (g_newIpBuffer[0] != '\0' && !ipValid) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Invalid IP address");
+        }
+
         ImGui::SetNextItemWidth(200.0f);
         ImGui::InputText("Subnet Mask", g_netmaskBuffer, sizeof(g_netmaskBuffer));
+        bool maskValid = IsValidSubnetMask(g_netmaskBuffer);
+        if (g_netmaskBuffer[0] != '\0' && !maskValid) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Invalid subnet mask");
+        }
+
         ImGui::SetNextItemWidth(200.0f);
         ImGui::InputText("Gateway", g_gatewayBuffer, sizeof(g_gatewayBuffer));
+        bool gwValid = IsValidIpv4(g_gatewayBuffer);
+        if (g_gatewayBuffer[0] != '\0' && !gwValid) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Invalid gateway address");
+        }
+
+        bool allFieldsValid = ipValid && maskValid && gwValid;
         
         ImGui::Spacing();
         
+        ImGui::BeginDisabled(!allFieldsValid);
         if (ImGui::Button("Push New IP")) {
             LivoxLidarIpInfo ipInfo;
             memset(&ipInfo, 0, sizeof(ipInfo));
@@ -1009,6 +1116,7 @@ int WINAPI WinMain(
                 AddLogMessage("Push New IP request sent, waiting for sensor response...");
             }
         }
+        ImGui::EndDisabled(); // !allFieldsValid
         
         ImGui::SameLine();
         if (ImGui::Button("Reboot Sensor")) {
@@ -1036,11 +1144,13 @@ int WINAPI WinMain(
         ImGui::Text("Log");
         {
             std::lock_guard<std::mutex> lock(g_logMutex);
-            ImGui::BeginChild("LogScrollArea", ImVec2(0.0f, 120.0f), ImGuiChildFlags_Borders);
+            ImGui::BeginChild("LogScrollArea", ImVec2(0.0f, 200.0f), ImGuiChildFlags_Borders);
             for (const std::string& line : g_logMessages) {
                 ImGui::TextWrapped("%s", line.c_str());
             }
-            if (!g_logMessages.empty()) {
+            // Auto-scroll: only snap to bottom if we were already at the bottom.
+            // This lets the user scroll up to read history without being yanked back.
+            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
                 ImGui::SetScrollHereY(1.0f);
             }
             ImGui::EndChild();
